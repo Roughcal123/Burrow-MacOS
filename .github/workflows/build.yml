@@ -1,0 +1,24 @@
+name: Build Burrow
+on: { workflow_dispatch: {}, push: { tags: ["v*"] } }
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: choco install innosetup -y
+      - run: cmd /c build.bat
+      - uses: actions/upload-artifact@v4
+        with: { name: Burrow-Windows, path: installer/Burrow-Setup.exe }
+  mac:
+    strategy:
+      matrix: { os: [macos-14, macos-15-intel] }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: bash build-mac.sh
+      - uses: actions/upload-artifact@v4
+        with: { name: "Burrow-macOS-${{ matrix.os }}", path: dist/*.dmg }
