@@ -2,6 +2,10 @@
 # Build Burrow.app and a drag-to-Applications DMG. Run on a Mac (needs Homebrew + Python 3.11+).
 set -euo pipefail
 cd "$(dirname "$0")"
+for f in burrow-helper.sh install-helper.sh; do
+  [ -f "resources/$f" ] || { echo "Missing resources/$f - upload the whole 'resources' folder to the repo root"; exit 1; }
+done
+mkdir -p resources
 command -v brew >/dev/null || { echo "Install Homebrew first: https://brew.sh"; exit 1; }
 brew install wireguard-tools wireguard-go
 python3 -m venv .venv && source .venv/bin/activate
