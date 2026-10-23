@@ -59,6 +59,21 @@ def save(c):
 
 
 def secret(name, value=None):
+    if IS_MAC:  # private file instead of the Keychain, so macOS never shows a password prompt
+        path = DATA / "secrets.json"
+        try:
+            d = json.loads(path.read_text())
+        except Exception:
+            d = {}
+        if value is None:
+            return d.get(name, "")
+        d[name] = value
+        ensure_data()
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(d, f)
+        os.chmod(path, 0o600)
+        return
     if value is None:
         return keyring.get_password(APP, name) or ""
     keyring.set_password(APP, name, value)
