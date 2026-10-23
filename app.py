@@ -1,10 +1,10 @@
 """Burrow - WireGuard over a WebSocket tunnel, supervised. Windows and macOS."""
-import sys, os, json, time, subprocess, threading, ipaddress, urllib.request, re, io, tarfile, base64, filecmp, platform
+import sys, os, json, time, subprocess, threading, ipaddress, urllib.request, re, io, tarfile, base64, filecmp, platform, hmac, hashlib
 from pathlib import Path
-from PySide6.QtCore import Qt, QTimer, Signal, QObject
-from PySide6.QtGui import QPainter, QColor, QIcon, QPixmap, QPen, QPainterPath, QAction
+from PySide6.QtCore import Qt, QTimer, Signal, QObject, QUrl
+from PySide6.QtGui import QPainter, QColor, QIcon, QPixmap, QPen, QPainterPath, QAction, QDesktopServices
 from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QPlainTextEdit, QDialog, QFormLayout, QLineEdit, QSystemTrayIcon, QMenu, QMessageBox)
+    QPlainTextEdit, QDialog, QFormLayout, QLineEdit, QSystemTrayIcon, QMenu, QMessageBox, QTabWidget)
 import keyring
 
 APP = "Burrow"
@@ -23,11 +23,18 @@ WGX = r"C:\Program Files\WireGuard\wg.exe" if IS_WIN else HELPER_DIR + "/wg"
 NOWIN = 0x08000000 if IS_WIN else 0
 LOCAL_PORT = 51821
 AMBER, MOSS, RED, GREY, NIGHT, PANEL = "#F5A623", "#4CAF7A", "#E5594F", "#9AA0A6", "#0F1419", "#2A2118"
+VERSION = "1.1.0"
+# Admin sign-in is a UI gate only (not real security): only a salted hash is stored in the app.
+ADMIN_SALT = bytes.fromhex("3267506b4afbc83983848a4d8a4d4087")
+ADMIN_HASH = "5c6f8a886328cce05bc7f29051c2d35e7d5e00eee394598ddcecc7494c24d30c"
 DEFAULTS = dict(server_ip="", server_pub="", address="10.66.66.3/32", dns="1.1.1.1", mtu="1380", wg_port="51820")
 
 
 def run(args, **kw):
-    return subprocess.run(args, capture_output=True, text=True, creationflags=NOWIN, **kw)
+    try:
+        return subprocess.run(args, capture_output=True, text=True, creationflags=NOWIN, **kw)
+    except OSError as e:  # tool missing or not runnable: report it instead of crashing
+        return subprocess.CompletedProcess(args, 127, "", str(e))
 
 
 def load():
@@ -152,6 +159,32 @@ def build_conf(c):
             f"PersistentKeepalive = 25\n")
 
 
+def check_admin(pw):
+    h = hashlib.pbkdf2_hmac("sha256", pw.encode(), ADMIN_SALT, 200_000)
+    return hmac.compare_digest(h.hex(), ADMIN_HASH)
+
+
+def admin_signed_in():
+    try:
+        return secret("admin_ok") == "1"
+    except Exception:
+        return False
+
+
+def redact(t):
+    for v in (secret("prefix"), secret("private_key")):
+        if v:
+            t = t.replace(v, "xxxx")
+    return t
+
+
+def ws_tail():
+    try:
+        return WSLOG.read_text(errors="replace")[-8000:]
+    except Exception:
+        return "(no wstunnel.log yet)"
+
+
 def make_icon(state="off", size=64):
     col = QColor({"off": GREY, "connecting": AMBER, "on": AMBER, "error": RED}[state])
     pm = QPixmap(size, size)
@@ -189,6 +222,7 @@ class Engine(QObject):
         super().__init__()
         self.proc, self.wslog = None, None
         self.up, self.busy, self.t0 = False, False, 0
+        self.last_ip = "-"
 
     # --- wstunnel ---
     def start_ws(self, c):
@@ -228,6 +262,16 @@ class Engine(QObject):
         except Exception:
             return None
 
+    def wg_show(self):
+        name = APP
+        if IS_MAC:
+            try:
+                name = Path("/var/run/burrow.name").read_text().strip()
+            except Exception:
+                return "(tunnel not up)"
+        r = run([WGX, "show", name])
+        return (r.stdout or r.stderr).strip() or "(no output)"
+
     # --- first-run setup: download and install what's missing ---
     def ensure_deps(self):
         try:
@@ -246,7 +290,7 @@ class Engine(QObject):
             self.state.emit("connecting", "Setting up WireGuard and wstunnel...")
             ok = self.ensure_deps()
             self.busy = False
-            self.state.emit("off" if ok else "error", "Ready" if ok else "Setup failed, see details")
+            self.state.emit("off" if ok else "error", "Ready" if ok else "Setup failed. Check your internet connection and try again")
             self.ready.emit(ok)
         if not self.busy:
             threading.Thread(target=go, daemon=True).start()
@@ -296,7 +340,7 @@ class Engine(QObject):
             return self._fail("Open Settings and fill in the server details first")
         self.state.emit("connecting", "Checking components...")
         if not self.ensure_deps():
-            return self._fail("Could not install WireGuard or wstunnel (see details)")
+            return self._fail("Could not install WireGuard or wstunnel. Check your internet connection")
         self.state.emit("connecting", "Digging in...")
         self._teardown()
         if not self.start_ws(c):
@@ -326,6 +370,7 @@ class Engine(QObject):
             ip = urllib.request.urlopen("https://ifconfig.me/ip", timeout=8).read().decode().strip()
         except Exception:
             ip = "unknown"
+        self.last_ip = ip
         self.exit_ip.emit(ip)
 
     # --- watchdog (called every few seconds) ---
@@ -453,6 +498,146 @@ class Settings(QDialog):
         self.accept()
 
 
+class Account(QDialog):
+    def __init__(self, main):
+        super().__init__(main)
+        self.main, self.fails = main, 0
+        self.setWindowTitle("Account")
+        self.setMinimumWidth(340)
+        lay = QVBoxLayout(self)
+        if main.admin:
+            lay.addWidget(QLabel("<b>Signed in as admin</b><br>Debug tools are unlocked on this device."))
+            dbg = QPushButton("Open Debug menu")
+            dbg.setObjectName("primary")
+            dbg.clicked.connect(lambda: (self.accept(), main.open_debug()))
+            out = QPushButton("Sign out")
+            out.clicked.connect(self.sign_out)
+            lay.addWidget(dbg)
+            lay.addWidget(out)
+        else:
+            lay.addWidget(QLabel("<b>Admin sign in</b><br>Sign in once to unlock the Debug menu on this device."))
+            self.pw = QLineEdit()
+            self.pw.setEchoMode(QLineEdit.Password)
+            self.pw.setPlaceholderText("Password")
+            self.pw.returnPressed.connect(self.sign_in)
+            self.msg = QLabel("")
+            self.msg.setStyleSheet(f"color:{RED}")
+            self.go = QPushButton("Sign in")
+            self.go.setObjectName("primary")
+            self.go.clicked.connect(self.sign_in)
+            for w in (self.pw, self.msg, self.go):
+                lay.addWidget(w)
+
+    def sign_in(self):
+        if check_admin(self.pw.text()):
+            try:
+                secret("admin_ok", "1")  # one-time login: remembered until you sign out
+            except Exception:
+                pass
+            self.main.set_admin(True)
+            self.accept()
+            self.main.open_debug()
+        else:
+            self.fails += 1
+            self.msg.setText("Wrong password")
+            self.pw.clear()
+            self.go.setEnabled(False)
+            QTimer.singleShot(min(self.fails, 5) * 1000, lambda: self.go.setEnabled(True))
+
+    def sign_out(self):
+        try:
+            secret("admin_ok", "")
+        except Exception:
+            pass
+        self.main.set_admin(False)
+        self.accept()
+
+
+class Debug(QDialog):
+    def __init__(self, main):
+        super().__init__(main)
+        self.main, self.eng, self.comp = main, main.eng, None
+        self.setWindowTitle("Burrow debug")
+        self.resize(640, 520)
+        self.tabs, self.box = QTabWidget(), {}
+        for n in ("Status", "Log", "wstunnel.log"):
+            b = QPlainTextEdit()
+            b.setReadOnly(True)
+            self.tabs.addTab(b, n)
+            self.box[n] = b
+        row = QHBoxLayout()
+        for label, fn in (("Refresh", self.full_refresh), ("Check exit IP", self.check_ip),
+                          ("Restart wstunnel", self.restart_ws), ("Copy report", self.copy),
+                          ("Open data folder", self.folder)):
+            b = QPushButton(label)
+            b.clicked.connect(lambda _=False, f=fn: f())
+            row.addWidget(b)
+        lay = QVBoxLayout(self)
+        lay.addLayout(row)
+        lay.addWidget(self.tabs)
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.refresh)
+        self.timer.start(3000)
+        self.refresh()
+
+    def status_text(self):
+        e, m, c = self.eng, self.main, load()
+        if self.comp is None:
+            self.comp = [component_info("WireGuard"), component_info("wstunnel")]
+        age = e.handshake_age() if e.up else None
+        run_ = e.proc is not None and e.proc.poll() is None
+        lines = [
+            f"Burrow {VERSION} on {platform.platform()} ({platform.machine()})",
+            f"State: {m.st}   Connected: {e.up}   Uptime: {int(time.time() - e.t0) if e.up else 0}s",
+            f"Exit IP: {e.last_ip}",
+            f"Handshake age: {'%.0fs' % age if age is not None else 'none'}",
+            f"wstunnel: {'running, pid %s' % e.proc.pid if run_ else 'not running'}",
+            "", "Components:", f"  WireGuard: {self.comp[0]}", f"  wstunnel: {self.comp[1]}",
+            "", "Settings:",
+            f"  server_ip={c['server_ip']} address={c['address']} dns={c['dns']} mtu={c['mtu']} wg_port={c['wg_port']}",
+            f"  server key: {'set' if c['server_pub'] else 'missing'}   "
+            f"private key: {'set' if secret('private_key') else 'missing'}   "
+            f"prefix: {'set' if secret('prefix') else 'missing'}",
+            "", f"Data folder: {DATA}", "", "wg show:", e.wg_show()]
+        return redact("\n".join(lines))
+
+    def put(self, name, text):
+        b = self.box[name]
+        sb = b.verticalScrollBar()
+        pos, at_end = sb.value(), sb.value() >= sb.maximum() - 2
+        if b.toPlainText() != text:
+            b.setPlainText(text)
+            sb.setValue(sb.maximum() if at_end else pos)
+
+    def refresh(self):
+        self.put("Status", self.status_text())
+        self.put("Log", redact("\n".join(self.main.logbuf)))
+        self.put("wstunnel.log", redact(ws_tail()))
+
+    def full_refresh(self):
+        self.comp = None
+        self.refresh()
+
+    def check_ip(self):
+        self.eng.last_ip = "checking..."
+        threading.Thread(target=self.eng._fetch_ip, daemon=True).start()
+
+    def restart_ws(self):
+        threading.Thread(target=lambda: self.eng.start_ws(load()), daemon=True).start()
+
+    def copy(self):
+        QApplication.clipboard().setText(redact(self.status_text() + "\n\n--- LOG ---\n" +
+                                                "\n".join(self.main.logbuf) + "\n\n--- wstunnel.log ---\n" + ws_tail()))
+
+    def folder(self):
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(DATA)))
+
+    def closeEvent(self, e):
+        self.timer.stop()
+        self.main.dbg = None
+        e.accept()
+
+
 STYLE = f"""
 QWidget {{ background:{NIGHT}; color:#E8EAED; font-family:Inter,'Segoe UI'; font-size:13px; }}
 QPlainTextEdit, QLineEdit {{ background:{PANEL}; border:1px solid #3a2f24; border-radius:6px; padding:6px;
@@ -473,34 +658,31 @@ class Main(QWidget):
     def __init__(self, eng):
         super().__init__()
         self.eng, self.st = eng, "off"
+        self.logbuf, self.dbg, self.admin = [], None, admin_signed_in()
         self.setWindowTitle(APP)
-        self.setFixedSize(380, 560)
+        self.setFixedSize(420, 420)
         self.logo = QLabel()
         title = QLabel(f"<span style='font-size:20px;font-weight:700'>{APP}</span><br>"
                        f"<span style='color:{GREY}'>Dig past the firewall.</span>")
-        gear = QPushButton("Settings")
-        gear.setObjectName("link")
-        gear.clicked.connect(lambda: Settings(self).exec())
         head = QHBoxLayout()
         head.addWidget(self.logo)
         head.addWidget(title, 1)
-        head.addWidget(gear)
+        self.dbgbtn = None
+        for label, fn in (("Debug", self.open_debug), ("Account", self.open_account),
+                          ("Settings", lambda: Settings(self).exec())):
+            b = QPushButton(label)
+            b.setObjectName("link")
+            b.clicked.connect(lambda _=False, f=fn: f())
+            head.addWidget(b)
+            if label == "Debug":
+                self.dbgbtn = b
+        self.dbgbtn.setVisible(self.admin)
         self.status, self.detail = QLabel(), QLabel()
         self.status.setObjectName("status")
         self.detail.setObjectName("dim")
         self.detail.setWordWrap(True)
-        self.ip, self.up = QLabel("Exit IP: -"), QLabel("Uptime: -")
-        stats = QHBoxLayout()
-        stats.addWidget(self.ip)
-        stats.addStretch()
-        stats.addWidget(self.up)
-        self.logbox = QPlainTextEdit()
-        self.logbox.setReadOnly(True)
-        self.logbox.hide()
-        tog = QPushButton("Show details")
-        tog.setObjectName("link")
-        tog.clicked.connect(lambda: (self.logbox.setVisible(not self.logbox.isVisible()),
-                                     tog.setText("Hide details" if self.logbox.isVisible() else "Show details")))
+        self.up = QLabel("Uptime: -")
+        self.up.setObjectName("dim")
         self.btn = QPushButton("Connect")
         self.btn.setObjectName("primary")
         self.btn.clicked.connect(self.toggle)
@@ -511,14 +693,11 @@ class Main(QWidget):
         lay.addWidget(self.status)
         lay.addWidget(self.detail)
         lay.addSpacing(10)
-        lay.addLayout(stats)
-        lay.addWidget(tog, 0, Qt.AlignLeft)
-        lay.addWidget(self.logbox, 1)
+        lay.addWidget(self.up)
         lay.addStretch(1)
         lay.addWidget(self.btn)  # Connect lives at the bottom
-        eng.log.connect(lambda m: self.logbox.appendPlainText(time.strftime("%H:%M:%S ") + m))
+        eng.log.connect(self.on_log)
         eng.state.connect(self.set_state)
-        eng.exit_ip.connect(lambda ip: self.ip.setText("Exit IP: " + ip))
         self.tray = QSystemTrayIcon(QIcon(make_icon("off")), self)
         menu = QMenu()
         for label, fn in (("Show", self.showNormal), ("Connect / Disconnect", self.toggle),
@@ -539,6 +718,27 @@ class Main(QWidget):
         eng.ready.connect(self.after_setup)
         QTimer.singleShot(400, lambda: eng.setup() if not (wg_ready() and wstunnel_path()) else self.after_setup(True))
 
+    def on_log(self, m):
+        self.logbuf.append(time.strftime("%H:%M:%S ") + m)
+        del self.logbuf[:-500]
+
+    def set_admin(self, flag):
+        self.admin = flag
+        self.dbgbtn.setVisible(flag)
+        if not flag and self.dbg:
+            self.dbg.close()
+
+    def open_account(self):
+        Account(self).exec()
+
+    def open_debug(self):
+        if not self.admin:
+            return self.open_account()
+        if self.dbg is None:
+            self.dbg = Debug(self)
+        self.dbg.show()
+        self.dbg.raise_()
+
     def after_setup(self, ok):
         if ok and not load()["server_ip"]:
             self.showNormal()
@@ -553,8 +753,6 @@ class Main(QWidget):
         self.tray.setIcon(QIcon(make_icon(st)))
         self.btn.setEnabled(st != "connecting")
         self.btn.setText("Disconnect" if st == "on" else "Connect")
-        if st != "on":
-            self.ip.setText("Exit IP: -")
 
     def refresh(self):
         if self.eng.up:

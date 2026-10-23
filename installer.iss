@@ -2,7 +2,7 @@
 [Setup]
 AppId={{B2F6C9A4-5D1E-4C7B-9A3E-0B7D1E2F4A10}
 AppName=Burrow
-AppVersion=1.0.0
+AppVersion=1.1.0
 AppPublisher=Burrow
 DefaultDirName={autopf}\Burrow
 DefaultGroupName=Burrow
