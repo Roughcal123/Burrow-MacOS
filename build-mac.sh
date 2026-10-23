@@ -21,7 +21,7 @@ for s in 16 32 64 128 256 512; do
 done
 iconutil -c icns burrow.iconset -o burrow.icns
 pyinstaller --noconfirm --windowed --name Burrow --icon burrow.icns \
-  --add-data "resources:resources" --collect-submodules keyring --copy-metadata keyring app.py
+  --add-data "resources:resources" --collect-data certifi --collect-submodules keyring --copy-metadata keyring app.py
 codesign --force --deep --sign - dist/Burrow.app
 rm -rf dmg && mkdir dmg && cp -R dist/Burrow.app dmg/ && ln -s /Applications dmg/Applications
 hdiutil create -volname Burrow -srcfolder dmg -ov -format UDZO "dist/Burrow-$ARCH.dmg"

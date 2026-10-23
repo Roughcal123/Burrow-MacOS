@@ -1,5 +1,5 @@
 """Burrow - WireGuard over a WebSocket tunnel, supervised. Windows and macOS."""
-import sys, os, json, time, subprocess, threading, ipaddress, urllib.request, re, io, tarfile, base64, filecmp, platform, hmac, hashlib
+import sys, os, json, time, subprocess, threading, ipaddress, urllib.request, urllib.error, ssl, re, io, tarfile, base64, filecmp, platform, hmac, hashlib
 from pathlib import Path
 from PySide6.QtCore import Qt, QTimer, Signal, QObject, QUrl
 from PySide6.QtGui import QPainter, QColor, QIcon, QPixmap, QPen, QPainterPath, QAction, QDesktopServices
@@ -73,7 +73,25 @@ def wstunnel_path():
 
 
 def http_get(url, timeout=30):
-    return urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": APP}), timeout=timeout).read()
+    """Try the bundled CA list first (packaged apps often have none), then the system store
+    (which also trusts a school/work network's own certificate if it is installed)."""
+    ctxs = []
+    try:
+        import certifi
+        ctxs.append(ssl.create_default_context(cafile=certifi.where()))
+    except Exception:
+        pass
+    ctxs.append(ssl.create_default_context())
+    last = None
+    for ctx in ctxs:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": APP})
+            return urllib.request.urlopen(req, timeout=timeout, context=ctx).read()
+        except urllib.error.URLError as e:
+            if not isinstance(e.reason, ssl.SSLError):
+                raise
+            last = e
+    raise RuntimeError(f"SSL certificate check failed for {url.split('/')[2]}: {last.reason}")
 
 
 def install_wstunnel(log):
@@ -367,7 +385,7 @@ class Engine(QObject):
 
     def _fetch_ip(self):
         try:
-            ip = urllib.request.urlopen("https://ifconfig.me/ip", timeout=8).read().decode().strip()
+            ip = http_get("https://ifconfig.me/ip", 8).decode().strip()
         except Exception:
             ip = "unknown"
         self.last_ip = ip
