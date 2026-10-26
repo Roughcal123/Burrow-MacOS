@@ -1,0 +1,11 @@
+.venv/
+dist/
+build/
+dmg/
+pkgsrc/
+resources/wg
+resources/wireguard-go
+resources/burrow-helper.sh
+*.icns
+*.iconset/
+burrow.png

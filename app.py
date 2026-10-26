@@ -145,15 +145,33 @@ def install_wireguard(log):
 
 
 def install_helper(log):
-    """macOS: one admin prompt installs the root-owned helper, WireGuard tools and a sudoers rule."""
+    """macOS: install the root helper from the bundled pkg - exactly one admin prompt."""
     log("Installing the network helper (macOS asks for your password once)")
-    sh = RES / "install-helper.sh"
-    r = run(["osascript", "-e", f'do shell script "bash \\"{sh}\\" \\"{RES}\\"" with administrator privileges'])
+    pkg = RES / "BurrowHelper.pkg"
+    if not pkg.exists():
+        raise RuntimeError("Helper package missing from the app bundle")
+    r = run(["osascript", "-e",
+             f'do shell script "installer -pkg \\"{pkg}\\" -target /" with administrator privileges'])
     if r.returncode:
         raise RuntimeError("helper install cancelled or failed: " + r.stderr.strip()[:120])
 
 
+
 INSTALL_WG = install_helper if IS_MAC else install_wireguard
+
+
+def mac_tun():
+    """Name of Burrow's utun device. Never guess the interface: the helper writes the exact
+    name, and we accept it only if wg actually knows about it."""
+    try:
+        n = Path("/var/run/burrow.tun").read_text().strip()
+    except Exception:
+        n = ""
+    if not n:
+        return ""
+    known = run([WGX, "show", "interfaces"]).stdout.split()
+    return n if n in known else ""
+
 
 
 def wg_ready():
@@ -284,9 +302,8 @@ class Engine(QObject):
     def handshake_age(self):
         name = APP
         if IS_MAC:
-            try:
-                name = Path("/var/run/burrow.name").read_text().strip()
-            except Exception:
+            name = mac_tun()
+            if not name:
                 return None
         r = run([WGX, "show", name, "latest-handshakes"])
         try:
@@ -298,9 +315,8 @@ class Engine(QObject):
     def wg_show(self):
         name = APP
         if IS_MAC:
-            try:
-                name = Path("/var/run/burrow.name").read_text().strip()
-            except Exception:
+            name = mac_tun()
+            if not name:
                 return "(tunnel not up)"
         r = run([WGX, "show", name])
         return (r.stdout or r.stderr).strip() or "(no output)"
@@ -478,9 +494,14 @@ class Settings(QDialog):
         ok = QPushButton("Save")
         ok.setObjectName("primary")
         ok.clicked.connect(self.done_)
+        self.owns = QPushButton("Uninstall Burrow from this Mac...")
+        self.owns.setStyleSheet(f"color:{RED}")
+        self.owns.clicked.connect(self.uninstall)
         lay = QVBoxLayout(self)
         lay.addLayout(form)
         lay.addWidget(ok)
+        lay.addWidget(self.owns)
+
         if not self.priv.text() and Path(WGX).exists():
             self.gen()
         self.show_pub()
@@ -510,6 +531,41 @@ class Settings(QDialog):
             self.installed.emit()
         threading.Thread(target=go, daemon=True).start()
 
+		    def uninstall(self):
+        """Disconnect, restore DNS/routes, remove the root helper. Settings and the app
+        are left alone - the .command removes those, with a real prompt."""
+        if QMessageBox.warning(
+                self, APP,
+                "Uninstall Burrow's network helper?\n\n"
+                "This disconnects the tunnel, restores your normal DNS and routes, then "
+                "removes the root helper and its sudoers rule.\n\n"
+                "Your saved server details and keys are NOT touched. To remove those and "
+                "the app itself, run Burrow Uninstall.command.",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        self.owns.setEnabled(False)
+        self.owns.setText("Uninstalling...")
+        threading.Thread(target=self._do_uninstall, daemon=True).start()
+
+    def _do_uninstall(self):
+        main = self.parent()
+        if main is not None and hasattr(main, "eng"):
+            main.eng.disconnect_(wait=True)
+        err = ""
+        if IS_MAC:
+            r1 = run(["sudo", "-n", "rm", "-rf", HELPER_DIR])
+            r2 = run(["sudo", "-n", "rm", "-f", "/etc/sudoers.d/burrow"])
+            if r1.returncode or r2.returncode:
+                err = ("Could not remove the root helper - it needs a fresh admin prompt.\n"
+                       "Run Burrow Uninstall.command instead.")
+        self.owns.setText("Uninstall Burrow from this Mac...")
+        self.owns.setEnabled(True)
+        self.installed.emit()
+        QMessageBox.information(self, APP, err or
+                                "Tunnel torn down and root helper removed.\n\n"
+                                "Run Burrow Uninstall.command to remove settings and the app.")
+
+		
     def imp(self):
         try:
             d = json.loads(base64.b64decode(self.code.text().strip()))
