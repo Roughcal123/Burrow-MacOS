@@ -1,6 +1,10 @@
 name: Build Burrow
-on: { workflow_dispatch: {}, push: { tags: ["v*"] } }
-permissions: { contents: write }
+on:
+  workflow_dispatch: {}
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
 jobs:
   windows:
     runs-on: windows-latest
@@ -15,25 +19,43 @@ jobs:
   mac:
     strategy:
       fail-fast: false
-      matrix: { os: [macos-14, macos-15-intel] }
+      matrix: { os: [macos-14, macos-15-intel] }   # Apple Silicon + Intel
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
-      - run: bash build-mac.sh
+      - name: Build app and DMG
+        env:
+          # Optional. Leave these secrets unset for an unsigned (ad-hoc) build.
+          CODESIGN_IDENTITY: ${{ secrets.CODESIGN_IDENTITY }}
+          NOTARY_APPLE_ID: ${{ secrets.NOTARY_APPLE_ID }}
+          NOTARY_TEAM_ID: ${{ secrets.NOTARY_TEAM_ID }}
+          NOTARY_PASSWORD: ${{ secrets.NOTARY_PASSWORD }}
+          MAC_CERT_P12: ${{ secrets.MAC_CERT_P12 }}
+          MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
+        run: |
+          if [ -n "$MAC_CERT_P12" ]; then
+            KC="$RUNNER_TEMP/build.keychain-db"
+            echo "$MAC_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+            security create-keychain -p ci "$KC"
+            security set-keychain-settings -lut 21600 "$KC"
+            security unlock-keychain -p ci "$KC"
+            security import "$RUNNER_TEMP/cert.p12" -k "$KC" -P "$MAC_CERT_PASSWORD" -T /usr/bin/codesign
+            security set-key-partition-list -S apple-tool:,apple: -s -k ci "$KC"
+            security list-keychains -d user -s "$KC" login.keychain-db
+          fi
+          bash build-mac.sh
       - uses: actions/upload-artifact@v4
         with: { name: "Burrow-macOS-${{ matrix.os }}", path: dist/*.dmg }
   release:
     needs: [windows, mac]
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
         with: { path: out, merge-multiple: true }
       - uses: softprops/action-gh-release@v2
         with:
-          tag_name: latest-build
-          name: Burrow latest build
-          prerelease: true
           files: out/*
+          generate_release_notes: true
