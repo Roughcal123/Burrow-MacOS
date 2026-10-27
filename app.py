@@ -164,7 +164,7 @@ def mac_tun():
     """Name of Burrow's utun device. Never guess the interface: the helper writes the exact
     name, and we accept it only if wg actually knows about it."""
     try:
-        n = Path("/var/run/burrow.tun").read_text().strip()
+        n = Path("/var/run/burrow.name").read_text().strip()
     except Exception:
         n = ""
     if not n:
@@ -531,7 +531,7 @@ class Settings(QDialog):
             self.installed.emit()
         threading.Thread(target=go, daemon=True).start()
 
-		    def uninstall(self):
+    def uninstall(self):
         """Disconnect, restore DNS/routes, remove the root helper. Settings and the app
         are left alone - the .command removes those, with a real prompt."""
         if QMessageBox.warning(
@@ -565,7 +565,6 @@ class Settings(QDialog):
                                 "Tunnel torn down and root helper removed.\n\n"
                                 "Run Burrow Uninstall.command to remove settings and the app.")
 
-		
     def imp(self):
         try:
             d = json.loads(base64.b64decode(self.code.text().strip()))
