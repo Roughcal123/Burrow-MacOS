@@ -1,0 +1,15 @@
+.venv/
+dist/
+build/
+dmg/
+pkgsrc/
+resources/wg
+resources/wireguard-go
+*.icns
+*.iconset/
+burrow.png
+burrow.ico
+*.spec
+__pycache__/
+.DS_Store
+resources/preset.json
