@@ -12,3 +12,4 @@ burrow.ico
 *.spec
 __pycache__/
 .DS_Store
+resources/preset.json

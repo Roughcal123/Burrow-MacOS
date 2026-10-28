@@ -22,6 +22,7 @@ WG = r"C:\Program Files\WireGuard\wireguard.exe" if IS_WIN else HELPER
 WGX = r"C:\Program Files\WireGuard\wg.exe" if IS_WIN else HELPER_DIR + "/wg"
 NOWIN = 0x08000000 if IS_WIN else 0
 LOCAL_PORT = 51821
+ENROLL_LOCAL, ENROLL_REMOTE = 51823, 51822  # temporary tunnel to the server's enrollment service
 AMBER, MOSS, RED, GREY, NIGHT, PANEL = "#F5A623", "#4CAF7A", "#E5594F", "#9AA0A6", "#0F1419", "#2A2118"
 VERSION = "1.1.0"
 # Admin sign-in is a UI gate only (not real security): only a salted hash is stored in the app.
@@ -223,7 +224,7 @@ def admin_signed_in():
 
 
 def redact(t):
-    for v in (secret("prefix"), secret("private_key")):
+    for v in (secret("prefix"), secret("private_key"), secret("enroll_token")):
         if v:
             t = t.replace(v, "xxxx")
     return t
@@ -261,6 +262,92 @@ def make_icon(state="off", size=64):
         p.drawEllipse(int(size / 2 - r), int(size * 0.62 - r), int(2 * r), int(2 * r))
     p.end()
     return pm
+
+
+def load_preset():
+    """Optional resources/preset.json (host, user, password, port) baked in at build time."""
+    try:
+        d = json.loads((RES / "preset.json").read_text())
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def server_script():
+    for p in (RES / "server-setup.sh", Path(__file__).parent / "server-setup.sh"):
+        if p.exists():
+            return p.read_text()
+    raise RuntimeError("server-setup.sh is missing from the app")
+
+
+def apply_code(d):
+    """Store a connection code (ip, pub, prefix, addr, priv) as Burrow's settings."""
+    c = load()
+    if d.get("token") and not d.get("addr"):  # enrollment code: this device makes its own key on first connect
+        c.update(server_ip=d["ip"])
+        save(c)
+        secret("prefix", d["prefix"])
+        secret("enroll_token", d["token"])
+        return
+    c.update(server_ip=d["ip"], server_pub=d["pub"], address=d["addr"])
+    save(c)
+    secret("prefix", d["prefix"])
+    secret("enroll_token", "")
+    if d.get("priv"):
+        secret("private_key", d["priv"])
+
+
+def enroll_pending(c):
+    return bool(secret("enroll_token")) and secret("enrolled") != c.get("server_ip")
+
+
+def provision(host, port, user, password, log):
+    """SSH into the VPS, run server-setup.sh there, and return the connection code it prints."""
+    import paramiko
+    cli = paramiko.SSHClient()
+    cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    log(f"Connecting to {host}...")
+    cli.connect(host, port=port, username=user, password=password or None, timeout=20,
+                banner_timeout=30, auth_timeout=30)
+    fp = hashlib.sha256(cli.get_transport().get_remote_server_key().asbytes()).hexdigest()[:16]
+    log(f"Connected (server key fingerprint {fp}). Installing, this takes 1-2 minutes...")
+    remote = f"/tmp/burrow-setup-{os.getpid()}.sh"
+    sftp = cli.open_sftp()
+    with sftp.open(remote, "w") as f:
+        f.write(server_script())
+    sftp.close()
+    sudo = user != "root"
+    chan = cli.get_transport().open_session()
+    chan.exec_command(f"sudo -S -p '' bash {remote}" if sudo else f"bash {remote}")
+    if sudo:
+        chan.send(password + "\n")
+    out, buf = [], b""
+    while True:
+        if chan.recv_ready():
+            buf += chan.recv(4096)
+        elif chan.recv_stderr_ready():
+            buf += chan.recv_stderr(4096)
+        elif chan.exit_status_ready():
+            break
+        else:
+            time.sleep(0.2)
+            continue
+        *lines, buf = buf.split(b"\n")
+        for ln in lines:
+            t = ln.decode("utf8", "replace").rstrip()
+            out.append(t)
+            if not re.fullmatch(r"[A-Za-z0-9+/=]{100,}", t):  # never show the key-bearing code
+                log(t)
+    out.append(buf.decode("utf8", "replace"))
+    rc = chan.recv_exit_status()
+    cli.exec_command(f"rm -f {remote}")
+    cli.close()
+    if rc:
+        raise RuntimeError("Server setup failed:\n" + "\n".join(l for l in out[-6:] if l and not re.fullmatch(r"[A-Za-z0-9+/=]{100,}", l.strip())))
+    codes = [l for l in out if re.fullmatch(r"[A-Za-z0-9+/=]{100,}", l.strip())]
+    if not codes:
+        raise RuntimeError("Setup finished but no connection code was printed")
+    return json.loads(base64.b64decode(codes[-1]))
 
 
 class Engine(QObject):
@@ -320,6 +407,50 @@ class Engine(QObject):
                 return "(tunnel not up)"
         r = run([WGX, "show", name])
         return (r.stdout or r.stderr).strip() or "(no output)"
+
+    # --- per-device enrollment: this device makes its own key and the server registers it ---
+    def enroll(self, c):
+        """Returns "" on success or an error message. The private key never leaves this device."""
+        import socket
+        exe = wstunnel_path()
+        priv = secret("private_key") or run([WGX, "genkey"]).stdout.strip()
+        pub = run([WGX, "pubkey"], input=priv).stdout.strip()
+        if not (exe and priv and pub):
+            return "Could not create this device's key"
+        proc = subprocess.Popen(
+            [exe, "client", "--http-upgrade-path-prefix", secret("prefix"), "-L",
+             f"tcp://127.0.0.1:{ENROLL_LOCAL}:127.0.0.1:{ENROLL_REMOTE}", f"wss://{c['server_ip']}:443"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=NOWIN)
+        err = "Could not reach the server to register this device"
+        try:
+            for _ in range(20):  # wait for the local end of the tunnel
+                try:
+                    socket.create_connection(("127.0.0.1", ENROLL_LOCAL), 1).close()
+                    break
+                except OSError:
+                    time.sleep(0.5)
+            body = json.dumps({"token": secret("enroll_token"), "pub": pub,
+                               "name": platform.node()[:40]}).encode()
+            for _ in range(3):
+                try:
+                    req = urllib.request.Request(f"http://127.0.0.1:{ENROLL_LOCAL}/enroll", body,
+                                                 {"Content-Type": "application/json"})
+                    r = json.loads(urllib.request.urlopen(req, timeout=20).read())
+                    c.update(server_pub=r["pub"], address=r["addr"])
+                    save(c)
+                    secret("private_key", priv)
+                    secret("enrolled", c["server_ip"])
+                    self.log.emit("This device is registered with the server")
+                    return ""
+                except urllib.error.HTTPError as e:
+                    err = f"The server refused to register this device ({e.code})"
+                    if e.code in (403, 429):
+                        break
+                except Exception:
+                    time.sleep(2)
+        finally:
+            proc.terminate()
+        return err
 
     # --- first-run setup: download and install what's missing ---
     def ensure_deps(self):
@@ -385,11 +516,19 @@ class Engine(QObject):
     def _connect(self):
         self.busy = True
         c = load()
-        if not (c["server_ip"] and c["server_pub"] and secret("private_key") and secret("prefix")):
+        pending = enroll_pending(c)
+        if not (c["server_ip"] and secret("prefix") and
+                (pending or (c["server_pub"] and secret("private_key")))):
             return self._fail("Open Settings and fill in the server details first")
         self.state.emit("connecting", "Checking components...")
         if not self.ensure_deps():
             return self._fail("Could not install WireGuard or wstunnel. Check your internet connection")
+        if pending:
+            self.state.emit("connecting", "Registering this device...")
+            err = self.enroll(c)
+            if err:
+                return self._fail(err)
+            c = load()
         self.state.emit("connecting", "Digging in...")
         self._teardown()
         if not self.start_ws(c):
@@ -494,17 +633,34 @@ class Settings(QDialog):
         ok = QPushButton("Save")
         ok.setObjectName("primary")
         ok.clicked.connect(self.done_)
+        auto = QPushButton("Set up a new server automatically...")
+        auto.clicked.connect(self.auto_setup)
         self.owns = QPushButton("Uninstall Burrow from this Mac...")
         self.owns.setStyleSheet(f"color:{RED}")
         self.owns.clicked.connect(self.uninstall)
         lay = QVBoxLayout(self)
         lay.addLayout(form)
+        lay.addWidget(auto)
         lay.addWidget(ok)
         lay.addWidget(self.owns)
 
-        if not self.priv.text() and Path(WGX).exists():
+        if not self.priv.text() and Path(WGX).exists() and not secret("enroll_token"):
             self.gen()
         self.show_pub()
+
+    def reload_fields(self):
+        c = load()
+        for k, w in self.f.items():
+            w.setText(str(c[k]))
+        self.priv.setText(secret("private_key"))
+        self.prefix.setText(secret("prefix"))
+        self.show_pub()
+
+    def auto_setup(self):
+        if ServerSetup(self).exec():
+            self.reload_fields()
+            QMessageBox.information(self, APP, "Server is ready and Burrow is configured. "
+                                    "Click Save, then Connect.")
 
     def show_pub(self):
         k = self.priv.text().strip()
@@ -568,10 +724,18 @@ class Settings(QDialog):
     def imp(self):
         try:
             d = json.loads(base64.b64decode(self.code.text().strip()))
+            if d.get("token") and not d.get("addr"):  # enrollment code
+                apply_code(d)
+                self.reload_fields()
+                return QMessageBox.information(self, APP, "Code accepted. This device will get its own "
+                                               "key the first time you connect.")
             self.f["server_ip"].setText(d["ip"])
             self.f["server_pub"].setText(d["pub"])
             self.f["address"].setText(d["addr"])
             self.prefix.setText(d["prefix"])
+            if d.get("priv"):  # codes made by "burrow-add-client" with no argument include a ready-made key
+                self.priv.setText(d["priv"])
+                self.show_pub()
         except Exception:
             QMessageBox.warning(self, APP, "That connection code isn't valid.")
 
@@ -583,6 +747,82 @@ class Settings(QDialog):
         save({k: v.text().strip() for k, v in self.f.items()})
         secret("private_key", self.priv.text().strip())
         secret("prefix", self.prefix.text().strip())
+        self.accept()
+
+
+class ServerSetup(QDialog):
+    log = Signal(str)
+    done = Signal(bool, str)
+
+    def __init__(self, parent=None, preset=None):
+        super().__init__(parent)
+        self.setWindowTitle("Set up your server")
+        self.setMinimumWidth(480)
+        self.host, self.user = QLineEdit(), QLineEdit("root")
+        self.pw, self.port = QLineEdit(), QLineEdit("22")
+        self.pw.setEchoMode(QLineEdit.Password)
+        self.host.setPlaceholderText("VPS IP address, e.g. 203.0.113.7")
+        info = QLabel("Burrow will log in to your VPS (Ubuntu, Debian or Fedora), install everything it "
+                      "needs and configure itself. Your password is used once and never saved.")
+        info.setWordWrap(True)
+        info.setObjectName("dim")
+        form = QFormLayout()
+        form.addRow("Server IP", self.host)
+        form.addRow("SSH user", self.user)
+        form.addRow("SSH password", self.pw)
+        form.addRow("SSH port", self.port)
+        self.go = QPushButton("Set up server")
+        self.go.setObjectName("primary")
+        self.go.clicked.connect(self.start)
+        self.manual = QPushButton("I already have a connection code")
+        self.manual.setObjectName("link")
+        self.manual.clicked.connect(self.reject)
+        self.out = QPlainTextEdit()
+        self.out.setReadOnly(True)
+        self.out.setMinimumHeight(140)
+        lay = QVBoxLayout(self)
+        for w in (info,):
+            lay.addWidget(w)
+        lay.addLayout(form)
+        lay.addWidget(self.go)
+        lay.addWidget(self.out)
+        lay.addWidget(self.manual)
+        self.log.connect(lambda m: self.out.appendPlainText(m))
+        self.done.connect(self.finished_)
+        p = preset or {}
+        if p.get("host"):
+            self.host.setText(str(p["host"]))
+            self.user.setText(str(p.get("user", "root")))
+            self.pw.setText(str(p.get("password", "")))
+            self.port.setText(str(p.get("port", 22)))
+            QTimer.singleShot(500, self.start)  # fully automatic: no click needed
+
+    def start(self):
+        host, user = self.host.text().strip(), self.user.text().strip() or "root"
+        if not host:
+            return QMessageBox.warning(self, APP, "Enter your server's IP address.")
+        try:
+            port = int(self.port.text() or 22)
+        except ValueError:
+            return QMessageBox.warning(self, APP, "SSH port must be a number.")
+        pw = self.pw.text()
+        self.go.setEnabled(False)
+        self.out.clear()
+
+        def go():
+            try:
+                apply_code(provision(host, port, user, pw, self.log.emit))
+                self.done.emit(True, "")
+            except Exception as e:
+                self.done.emit(False, str(e)[:400])
+        threading.Thread(target=go, daemon=True).start()
+
+    def finished_(self, ok, err):
+        self.go.setEnabled(True)
+        if not ok:
+            self.out.appendPlainText(err)
+            return QMessageBox.warning(self, APP, "Could not set up the server.\n\n" + err)
+        self.pw.clear()
         self.accept()
 
 
@@ -829,8 +1069,18 @@ class Main(QWidget):
 
     def after_setup(self, ok):
         if ok and not load()["server_ip"]:
+            pre = load_preset()
+            if pre.get("code"):  # build came with a ready connection code: configure and connect
+                apply_code(pre["code"])
+                if self.st == "off":
+                    QTimer.singleShot(300, self.toggle)
+                return
             self.showNormal()
-            Settings(self).exec()
+            if ServerSetup(self, load_preset()).exec():  # configured automatically: connect straight away
+                if self.st == "off":
+                    QTimer.singleShot(300, self.toggle)
+            else:
+                Settings(self).exec()
 
     def set_state(self, st, detail):
         self.st = st
@@ -863,7 +1113,20 @@ class Main(QWidget):
         self.tray.showMessage(APP, "Still running in the tray.", QSystemTrayIcon.Information, 2000)
 
 
+def make_preset():
+    """Build-time: SSH into the VPS (login comes from env vars, kept in CI secrets), set it up, and
+    write resources/preset.json holding only a fresh connection code - never the SSH login."""
+    d = provision(os.environ["BURROW_SSH_HOST"], int(os.environ.get("BURROW_SSH_PORT", 22)),
+                  os.environ.get("BURROW_SSH_USER", "root"), os.environ.get("BURROW_SSH_PASSWORD", ""), print)
+    out = Path(__file__).parent / "resources"
+    out.mkdir(exist_ok=True)
+    (out / "preset.json").write_text(json.dumps({"code": d}))
+    print("Preset written (connection code only, no SSH login).")
+
+
 def main():
+    if "--make-preset" in sys.argv:
+        return make_preset()
     app = QApplication(sys.argv)
     if "--icon" in sys.argv:  # used by build.bat to make burrow.ico
         make_icon("on", 256).save("burrow.ico")

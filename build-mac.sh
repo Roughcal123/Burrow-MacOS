@@ -45,11 +45,19 @@ V=$(grep -m1 '^VERSION' app.py | cut -d'"' -f2)
 pkgbuild --root pkgsrc --scripts pkg/scripts --identifier com.burrow.helper \
   --version "$V" --install-location / "dist/BurrowHelper.pkg"
 
+# --- optional zero-click setup: provision the VPS now and bake in a connection CODE only ---
+# (BURROW_SSH_* come from CI secrets; the SSH login itself is NOT put in the app.)
+rm -f resources/preset.json
+if [ -n "${BURROW_SSH_HOST:-}" ]; then
+  python app.py --make-preset
+fi
+
 # --- app ---
 pyinstaller --noconfirm --windowed --name Burrow --icon burrow.icns \
   --osx-bundle-identifier com.burrow.app \
   --add-data "resources:resources" \
   --add-data "dist/BurrowHelper.pkg:resources" \
+  --add-data "server-setup.sh:resources" --hidden-import paramiko \
   --collect-data certifi --collect-submodules keyring --copy-metadata keyring app.py
 
 # Sign LAST, after every --add-data, or the added resources invalidate the signature.

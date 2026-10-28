@@ -1,3 +1,4 @@
 PySide6-Essentials>=6.6
 keyring>=24
 certifi
+paramiko>=3.4

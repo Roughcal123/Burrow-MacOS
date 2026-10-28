@@ -14,6 +14,33 @@ WireGuard over a WebSocket tunnel (wstunnel) for macOS and Windows.
 
 To remove everything, run **Burrow Uninstall.command** from the DMG.
 
+## Set up the server (automatic, one key per person)
+
+Get any small Ubuntu, Debian or Fedora VPS (1 vCPU / 512 MB is plenty) and note its IP and a login with sudo.
+
+**Zero-click builds (recommended).** Add repository secrets `BURROW_SSH_HOST`, `BURROW_SSH_USER`,
+`BURROW_SSH_PASSWORD`, then push a tag. During the build GitHub logs in to the VPS, sets it up, and bakes an
+**enrollment code** into the app (your SSH login stays in GitHub secrets and is never put in the app).
+When anyone opens Burrow for the first time, the app creates **its own private key on that device**, registers
+the matching public key with your server through the tunnel, and connects. Nothing to type.
+
+**Manual.** SSH in and run:
+
+    curl -fsSL https://raw.githubusercontent.com/<you>/<repo>/main/server-setup.sh | sudo bash
+
+then paste the printed enrollment code into Burrow > Settings > Connection code > Import.
+
+### Managing devices (on the server)
+
+    sudo burrow-admin list              # every enrolled device
+    sudo burrow-admin revoke <name|ip>  # cut one device off
+    sudo burrow-admin rotate            # new enrollment token for future installs (existing devices keep working)
+    sudo burrow-admin code              # reprint the enrollment code
+
+Limits: 250 devices, and at most 30 new devices per 10 minutes. The enrollment code lets whoever holds the app
+register new devices, so keep the repo/releases private and rotate the token if a build leaks.
+If your VPS provider has its own cloud firewall, allow inbound **TCP 443** there.
+
 ## Build locally (on a Mac)
 
     brew install python   # 3.11+
