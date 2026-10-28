@@ -107,6 +107,13 @@ def http_get(url, timeout=30):
             if not isinstance(e.reason, ssl.SSLError):
                 raise
             last = e
+    if IS_MAC:  # Apple's curl trusts the Keychain, including a certificate that a network/antivirus re-signs with
+        r = subprocess.run(["/usr/bin/curl", "-fsSL", "--max-time", str(timeout), "-A", APP, url],
+                           capture_output=True)
+        if r.returncode == 0 and r.stdout:
+            return r.stdout
+        last = RuntimeError(r.stderr.decode("utf8", "replace").strip()[:200] or f"curl exit {r.returncode}")
+        raise RuntimeError(f"Could not securely reach {url.split('/')[2]}: {last}")
     raise RuntimeError(f"SSL certificate check failed for {url.split('/')[2]}: {last.reason}")
 
 

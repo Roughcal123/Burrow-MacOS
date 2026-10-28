@@ -37,6 +37,7 @@ up() {
   WG_TUN_NAME_FILE=$NAMEF "$D/wireguard-go" utun >/dev/null 2>&1 || { echo "wireguard-go failed" >&2; exit 4; }
   for _ in $(seq 1 50); do [ -s "$NAMEF" ] && break; sleep 0.1; done
   TUN=$(cat "$NAMEF" 2>/dev/null); [ -n "$TUN" ] || { echo "no tunnel device" >&2; exit 4; }
+  chmod 644 "$NAMEF"   # wireguard-go creates it root-only; the app (running as the user) must read the name
   for _ in $(seq 1 50); do [ -S "/var/run/wireguard/$TUN.sock" ] && break; sleep 0.1; done
   chown "$UIDN" "/var/run/wireguard/$TUN.sock"   # lets the app run "wg show" without root
 
