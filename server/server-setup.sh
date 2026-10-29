@@ -392,6 +392,18 @@ NGX
   for f in $FILES; do
     real=$(readlink -f "$f")
     grep -q 'snippets/burrow.conf' "$real" && continue
+    # a hand-made tunnel location for this secret path already exists here: adding ours would be a duplicate
+    # Keep it, but point it at the wstunnel we just started (it may still aim at an old port).
+    if grep -qF "location /$PREFIX/" "$real"; then
+      i=$((i+1)); cp -a "$real" "$NBK/$i"; printf '%s\t%s\n' "$i" "$real" >> "$NBK/manifest"
+      awk -v loc="location /$PREFIX/" -v to="http://127.0.0.1:$LPORT" '
+        index($0, loc) {inloc=1}
+        inloc && /proxy_pass/ {sub(/proxy_pass[[:space:]]+[^;]+;/, "proxy_pass " to ";")}
+        {print}
+        inloc && /}/ {inloc=0}' "$real" > "$real.burrow" && cat "$real.burrow" > "$real" && rm -f "$real.burrow"
+      echo "Reusing the existing tunnel location in $real (now forwarding to 127.0.0.1:$LPORT)"
+      continue
+    fi
     i=$((i+1)); cp -a "$real" "$NBK/$i"; printf '%s\t%s\n' "$i" "$real" >> "$NBK/manifest"
     # add the include once per server block, right after its first "listen ... 443" line
     awk '/^[[:space:]]*server[[:space:]]*\{/ {inc=0}
