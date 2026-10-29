@@ -8,7 +8,7 @@ set -euo pipefail
 [ "$(id -u)" = 0 ] || { echo "Run as root: sudo bash server-setup.sh"; exit 1; }
 say() { printf '\n==> %s\n' "$*"; }
 
-WG_IF=wg0; WG_PORT=51820; SUBNET=10.66.66; WS_PORT=443; ENROLL_PORT=51822
+WG_IF=wg0; WG_PORT=51820; SUBNET=10.66.66; WS_PORT=443; ENROLL_PORT=51822; NGINX_LOCAL_PORT=8443
 # Where wstunnel listens. Default: wss://0.0.0.0:443 (it owns port 443).
 # Behind nginx/Caddy: run  WS_BIND=ws://127.0.0.1:PORT bash server-setup.sh  once; it is remembered for re-runs.
 mkdir -p /etc/burrow
@@ -29,14 +29,22 @@ fi
 modprobe wireguard 2>/dev/null || true
 
 # ---- if wstunnel will own port 443, nothing else may be using it ----
+# nginx already on 443 (e.g. a website): put wstunnel behind it automatically instead of giving up.
+BEHIND_NGINX=0
 if [ "$WS_BIND" = "wss://0.0.0.0:$WS_PORT" ] && ss -ltnpH "sport = :$WS_PORT" 2>/dev/null | grep -q . \
    && ! ss -ltnpH "sport = :$WS_PORT" | grep -q wstunnel; then
-  echo "Port $WS_PORT is used by another program (a web server such as nginx):"
-  ss -ltnpH "sport = :$WS_PORT" | sed -E 's/^/  /'
-  echo "Nothing was changed. If wstunnel should sit behind it, re-run with the local port your proxy forwards to:"
-  echo "  WS_BIND=ws://127.0.0.1:PORT bash server-setup.sh"
-  exit 1
+  if ss -ltnpH "sport = :$WS_PORT" | grep -q nginx && [ -d /etc/nginx ]; then
+    echo "nginx is using port $WS_PORT: wstunnel will run behind it on 127.0.0.1:$NGINX_LOCAL_PORT"
+    WS_BIND=ws://127.0.0.1:$NGINX_LOCAL_PORT
+  else
+    echo "Port $WS_PORT is used by another program:"
+    ss -ltnpH "sport = :$WS_PORT" | sed -E 's/^/  /'
+    echo "Nothing was changed. If wstunnel should sit behind it, re-run with the local port your proxy forwards to:"
+    echo "  WS_BIND=ws://127.0.0.1:PORT bash server-setup.sh"
+    exit 1
+  fi
 fi
+case "$WS_BIND" in ws://127.0.0.1:*) command -v nginx >/dev/null && [ -d /etc/nginx ] && BEHIND_NGINX=1;; esac
 echo "$WS_BIND" > /etc/burrow/ws-bind
 
 # ---- back up any existing config before changing anything ----
@@ -355,6 +363,60 @@ sleep 2
 systemctl is-active --quiet wg-quick@$WG_IF || { echo "WireGuard failed to start:"; journalctl -u wg-quick@$WG_IF -n 15 --no-pager; exit 1; }
 systemctl is-active --quiet burrow-enroll || { echo "enrollment service failed to start:"; journalctl -u burrow-enroll -n 15 --no-pager; exit 1; }
 systemctl is-active --quiet wstunnel || { echo "wstunnel failed to start:"; journalctl -u wstunnel -n 15 --no-pager; exit 1; }
+
+# ---- behind nginx: forward only the secret path to wstunnel, leave every website untouched ----
+if [ "$BEHIND_NGINX" = 1 ]; then
+  say "Connecting nginx to wstunnel"
+  LPORT=${WS_BIND##*:}
+  PREFIX=$(cut -d= -f2 /etc/wstunnel/wstunnel.env)
+  mkdir -p /etc/nginx/snippets
+  cat > /etc/nginx/snippets/burrow.conf <<NGX
+# Burrow: WebSocket tunnel (managed by server-setup.sh)
+location /${PREFIX}/ {
+    proxy_pass http://127.0.0.1:${LPORT};
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade \$http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host \$host;
+    proxy_buffering off;
+    proxy_read_timeout 1d;
+    proxy_send_timeout 1d;
+}
+NGX
+  chmod 600 /etc/nginx/snippets/burrow.conf
+  # include it in every server block that listens on 443 (the app connects by IP, so the default site must have it)
+  FILES=$(grep -rlE '^[[:space:]]*listen[[:space:]]+([^;]*:)?443([^0-9]|$)' /etc/nginx/sites-enabled /etc/nginx/conf.d /etc/nginx/nginx.conf 2>/dev/null | sort -u || true)
+  [ -n "$FILES" ] || { echo "Could not find an nginx site listening on 443"; exit 1; }
+  NBK=$BK/nginx; mkdir -p "$NBK"
+  : > "$NBK/manifest"; i=0
+  for f in $FILES; do
+    real=$(readlink -f "$f")
+    grep -q 'snippets/burrow.conf' "$real" && continue
+    i=$((i+1)); cp -a "$real" "$NBK/$i"; printf '%s\t%s\n' "$i" "$real" >> "$NBK/manifest"
+    # add the include once per server block, right after its first "listen ... 443" line
+    awk '/^[[:space:]]*server[[:space:]]*\{/ {inc=0}
+         {print}
+         /^[[:space:]]*listen[[:space:]]+([^;]*:)?443([^0-9]|$)/ && !inc {print "    include /etc/nginx/snippets/burrow.conf;"; inc=1}' \
+      "$real" > "$real.burrow" && cat "$real.burrow" > "$real" && rm -f "$real.burrow"
+  done
+  if nginx -t >/dev/null 2>&1; then
+    systemctl reload nginx
+  else
+    echo "nginx rejected the change, restoring the original config:"; nginx -t || true
+    while IFS=$'\t' read -r n path; do cat "$NBK/$n" > "$path"; done < "$NBK/manifest"
+    exit 1
+  fi
+fi
+
+# ---- self-test: the tunnel endpoint must answer as wstunnel, not as a web page ----
+PREFIX=$(cut -d= -f2 /etc/wstunnel/wstunnel.env)
+CODE=$(curl -sk --http1.1 --max-time 8 -o /dev/null -w '%{http_code}' -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+  -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' "https://127.0.0.1:$WS_PORT/$PREFIX/events" || true)
+if [ "$CODE" = 404 ] || [ "$CODE" = 000 ]; then
+  echo "WARNING: port $WS_PORT does not reach wstunnel (HTTP $CODE). Burrow will not be able to connect."
+else
+  echo "Tunnel endpoint OK (HTTP $CODE from wstunnel)"
+fi
 
 say "Server is ready"
 echo "NOTE: if your VPS provider has its own firewall (AWS, Oracle, Hetzner, etc.), allow inbound TCP $WS_PORT there too."

@@ -117,6 +117,36 @@ def http_get(url, timeout=30):
     raise RuntimeError(f"SSL certificate check failed for {url.split('/')[2]}: {last.reason}")
 
 
+def probe_server(ip, prefix, timeout=8):
+    """Ask port 443 for the tunnel's WebSocket path, the same way wstunnel does.
+    Returns "" if wstunnel answered, otherwise a human-readable reason.
+    (wstunnel itself does not verify the certificate, so neither does this check.)"""
+    import socket
+    ctx = ssl.create_default_context()
+    ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE
+    req = (f"GET /{prefix}/events HTTP/1.1\r\nHost: {ip}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+           "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n")
+    try:
+        with socket.create_connection((ip, 443), timeout) as raw, ctx.wrap_socket(raw, server_hostname=None) as s:
+            s.settimeout(timeout)
+            s.sendall(req.encode())
+            head = s.recv(4096).decode("latin1", "replace")
+    except (socket.timeout, TimeoutError):
+        return f"The server {ip} did not answer on port 443 (blocked by a firewall?)"
+    except ConnectionRefusedError:
+        return f"Nothing is listening on port 443 at {ip}. Run the server setup again"
+    except ssl.SSLError as e:
+        return f"Port 443 at {ip} is not speaking TLS ({e.reason})"
+    except OSError as e:
+        return f"Could not reach {ip}: {e}"
+    status = head.split(" ", 2)[1] if head.count(" ") >= 2 else "?"
+    server = next((l.split(":", 1)[1].strip() for l in head.splitlines() if l.lower().startswith("server:")), "")
+    if status == "404" or (server and "nginx" in server.lower() and status != "101"):
+        return (f"Port 443 on {ip} is answered by a web server ({server or 'unknown'}), not by Burrow's tunnel. "
+                "Re-run the server setup (Settings > Server setup) so it connects that web server to wstunnel")
+    return ""
+
+
 def install_wstunnel(log):
     rel = json.loads(http_get("https://api.github.com/repos/erebe/wstunnel/releases/latest"))
     ver = rel["tag_name"].lstrip("v")
@@ -530,6 +560,10 @@ class Engine(QObject):
         self.state.emit("connecting", "Checking components...")
         if not self.ensure_deps():
             return self._fail("Could not install WireGuard or wstunnel. Check your internet connection")
+        self.state.emit("connecting", "Checking the server...")
+        why = probe_server(c["server_ip"], secret("prefix"))
+        if why:
+            return self._fail(why)
         if pending:
             self.state.emit("connecting", "Registering this device...")
             err = self.enroll(c)
@@ -551,7 +585,11 @@ class Engine(QObject):
                 self._fetch_ip()
                 return
             time.sleep(1)
-        self._fail("No handshake. Check server details and that the server is reachable")
+        tail = [l for l in ws_tail().splitlines() if "ERROR" in l or "WARN" in l][-3:]
+        for l in tail:
+            self.log.emit("wstunnel: " + redact(l)[-200:])
+        self._fail("No handshake. The tunnel reached the server but WireGuard got no reply: "
+                   "this device may not be registered (sudo burrow-admin list on the server)")
 
     def _disconnect(self):
         self.state.emit("connecting", "Surfacing...")
