@@ -385,7 +385,7 @@ location /${PREFIX}/ {
 NGX
   chmod 600 /etc/nginx/snippets/burrow.conf
   # include it in every server block that listens on 443 (the app connects by IP, so the default site must have it)
-  FILES=$(grep -rlE '^[[:space:]]*listen[[:space:]]+([^;]*:)?443([^0-9]|$)' /etc/nginx/sites-enabled /etc/nginx/conf.d /etc/nginx/nginx.conf 2>/dev/null | sort -u || true)
+  FILES=$(grep -RlE '^[[:space:]]*listen[[:space:]]+([^;]*:)?443([^0-9]|$)' /etc/nginx/sites-enabled /etc/nginx/conf.d /etc/nginx/nginx.conf 2>/dev/null | sort -u || true)
   [ -n "$FILES" ] || { echo "Could not find an nginx site listening on 443"; exit 1; }
   NBK=$BK/nginx; mkdir -p "$NBK"
   : > "$NBK/manifest"; i=0
