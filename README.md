@@ -41,6 +41,10 @@ Limits: 250 devices, and at most 30 new devices per 10 minutes. The enrollment c
 register new devices, so keep the repo/releases private and rotate the token if a build leaks.
 If your VPS provider has its own cloud firewall, allow inbound **TCP 443** there.
 
+**Already running nginx on 443 (a website)?** The setup script detects it, runs wstunnel on `127.0.0.1:8443`
+and adds a single secret-path `location` to your 443 sites (`/etc/nginx/snippets/burrow.conf`). Your websites are
+not affected; the originals are backed up under `/root/burrow-backup-*/nginx`. If nginx rejects the change, it is rolled back.
+
 ## Build locally (on a Mac)
 
     brew install python   # 3.11+
