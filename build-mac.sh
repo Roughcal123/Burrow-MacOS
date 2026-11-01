@@ -27,6 +27,16 @@ if otool -L resources/wg resources/wireguard-go | grep -E "/(opt|usr/local)/(hom
   echo "ERROR: a bundled tool links against a Homebrew library"; exit 1
 fi
 
+# --- wstunnel: bundled so the app never has to download it (no HTTPS/certificate step at first run) ---
+case "$ARCH" in arm64) WSA=darwin_arm64;; *) WSA=darwin_amd64;; esac
+WSURL=$(curl -fsSL https://api.github.com/repos/erebe/wstunnel/releases/latest \
+  | grep -oE "https://[^\"]+/wstunnel_[0-9.]+_${WSA}\.tar\.gz" | head -1)
+[ -n "$WSURL" ] || { echo "Could not find a wstunnel download for $WSA"; exit 1; }
+rm -f resources/wstunnel
+curl -fsSL "$WSURL" | tar -xz -C resources wstunnel
+chmod 755 resources/wstunnel
+resources/wstunnel --version
+
 # --- icon ---
 QT_QPA_PLATFORM=offscreen python app.py --icon
 [ -f burrow.png ] || { echo "Icon generation failed"; exit 1; }

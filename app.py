@@ -82,7 +82,7 @@ def secret(name, value=None):
 
 def wstunnel_path():
     base = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
-    for p in (BIN / EXE, base / EXE, Path(r"C:\Program Files\wstunnel\wstunnel.exe")):
+    for p in (RES / EXE, BIN / EXE, base / EXE, Path(r"C:\Program Files\wstunnel\wstunnel.exe")):
         if p.exists():
             return str(p)
     return None

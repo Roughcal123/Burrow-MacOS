@@ -13,3 +13,4 @@ burrow.ico
 __pycache__/
 .DS_Store
 resources/preset.json
+resources/wstunnel
