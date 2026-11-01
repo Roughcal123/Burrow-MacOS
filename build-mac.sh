@@ -29,11 +29,11 @@ fi
 
 # --- wstunnel: bundled so the app never has to download it (no HTTPS/certificate step at first run) ---
 case "$ARCH" in arm64) WSA=darwin_arm64;; *) WSA=darwin_amd64;; esac
-WSURL=$(curl -fsSL https://api.github.com/repos/erebe/wstunnel/releases/latest \
-  | grep -oE "https://[^\"]+/wstunnel_[0-9.]+_${WSA}\.tar\.gz" | head -1)
-[ -n "$WSURL" ] || { echo "Could not find a wstunnel download for $WSA"; exit 1; }
+# Pinned version: a direct download link, so the build never depends on GitHub's rate-limited API.
+WSV=${WSTUNNEL_VERSION:-11.1.0}
+WSURL="https://github.com/erebe/wstunnel/releases/download/v${WSV}/wstunnel_${WSV}_${WSA}.tar.gz"
 rm -f resources/wstunnel
-curl -fsSL "$WSURL" | tar -xz -C resources wstunnel
+curl -fsSL --retry 4 --retry-delay 5 "$WSURL" | tar -xz -C resources wstunnel
 chmod 755 resources/wstunnel
 resources/wstunnel --version
 
