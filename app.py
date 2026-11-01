@@ -24,7 +24,7 @@ NOWIN = 0x08000000 if IS_WIN else 0
 LOCAL_PORT = 51821
 ENROLL_LOCAL, ENROLL_REMOTE = 51823, 51822  # temporary tunnel to the server's enrollment service
 AMBER, MOSS, RED, GREY, NIGHT, PANEL = "#F5A623", "#4CAF7A", "#E5594F", "#9AA0A6", "#0F1419", "#2A2118"
-VERSION = "1.1.0"
+VERSION = "1.2.1"
 # Admin sign-in is a UI gate only (not real security): only a salted hash is stored in the app.
 ADMIN_SALT = bytes.fromhex("3267506b4afbc83983848a4d8a4d4087")
 ADMIN_HASH = "5c6f8a886328cce05bc7f29051c2d35e7d5e00eee394598ddcecc7494c24d30c"

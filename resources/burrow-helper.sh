@@ -54,7 +54,11 @@ up() {
   printf '%s\n%s\n%s\n' "$SVC" "$OLD" "$SRV" > "$ST"
 
   # server must bypass the tunnel (wstunnel's own connection), everything else goes through it
+  route -q -n delete -host "$SRV" >/dev/null 2>&1   # a stale route from an earlier run would make "add" fail
   if [ -n "$GW" ]; then route -q -n add -host "$SRV" "$GW"; else route -q -n add -host "$SRV" -interface "$IFACE"; fi
+  # if the bypass route did not take, wstunnel's own connection would loop into the tunnel and hang: stop here
+  VIA=$(route -n get "$SRV" 2>/dev/null | awk '/interface:/{print $2}')
+  [ "$VIA" = "$IFACE" ] || { down; echo "could not route $SRV outside the tunnel (goes via ${VIA:-nothing}, expected $IFACE)" >&2; exit 7; }
   route -q -n add -inet 0.0.0.0/1 -interface "$TUN"
   route -q -n add -inet 128.0.0.0/1 -interface "$TUN"
   # IPv6 has no path through the tunnel: send it into the (empty) tunnel so it can't leak
